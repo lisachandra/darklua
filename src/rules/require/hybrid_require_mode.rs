@@ -1,15 +1,15 @@
-use std::{
-    collections::VecDeque,
-    path::{Path, PathBuf},
-};
+use core::option::Option::None;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::{
     frontend::DarkluaResult,
-    nodes::{Arguments, Expression, FieldExpression, FunctionCall, Prefix},
-    rules::parse_roblox,
-    DarkluaError,
+    nodes::{Arguments, Expression, FunctionCall, Prefix},
+    rules::{
+        convert_require::{instance_path::InstancePath, rojo_sourcemap::RojoSourcemap},
+        parse_roblox, Context,
+    }, DarkluaError,
 };
 
 use super::{match_path_require_call, PathRequireMode, RequirePathLocatorMode};
@@ -21,6 +21,42 @@ pub struct HybridRequireMode {
 
     #[serde(default)]
     convert_ts_imports: bool,
+
+    #[serde(skip)]
+    cached_sourcemap: Option<RojoSourcemap>,
+
+    rojo_sourcemap: Option<PathBuf>,
+}
+
+impl HybridRequireMode {
+    pub(crate) fn initialize(&mut self, context: &Context) -> DarkluaResult<()> {
+        if let Some(ref rojo_sourcemap_path) = self
+            .rojo_sourcemap
+            .as_ref()
+            .map(|rojo_sourcemap_path| context.project_location().join(rojo_sourcemap_path))
+        {
+            context.add_file_dependency(rojo_sourcemap_path.clone());
+
+            let sourcemap_parent_location = get_relative_parent_path(rojo_sourcemap_path);
+            let sourcemap = RojoSourcemap::parse(
+                &context
+                    .resources()
+                    .get(rojo_sourcemap_path)
+                    .map_err(|err| {
+                        DarkluaError::from(err).context("while initializing Roblox require mode")
+                    })?,
+                sourcemap_parent_location,
+            )
+            .map_err(|err| {
+                err.context(format!(
+                    "unable to parse Rojo sourcemap at `{}`",
+                    rojo_sourcemap_path.display()
+                ))
+            })?;
+            self.cached_sourcemap = Some(sourcemap);
+        }
+        Ok(())
+    }
 }
 
 impl RequirePathLocatorMode for HybridRequireMode {
@@ -41,7 +77,7 @@ impl RequirePathLocatorMode for HybridRequireMode {
             })
             .or(match_path_require_call(call))
     }
-    fn require_call(&self, call: &FunctionCall, source: &Path) -> Option<PathBuf> {
+    fn require_call(&self, call: &FunctionCall, _source: &Path) -> Option<PathBuf> {
         if !self.convert_ts_imports {
             return None;
         }
@@ -60,125 +96,82 @@ impl RequirePathLocatorMode for HybridRequireMode {
         let Arguments::Tuple(values) = call.get_arguments() else {
             return None;
         };
-        let mut current_path = source.to_path_buf();
+        if values.iter_values().count() == 0 {
+            return None;
+        };
 
-        if current_path.ends_with("init.lua") || current_path.ends_with("init.luau") {
-            current_path.pop();
+        let mut values_iter = values.iter_values();
+        values_iter.next();
+
+        let mut instance_path = InstancePath::from_root();
+        if let Some(service_name_expression) = values_iter.next() {
+            if let Expression::Call(x) = service_name_expression {
+                if let Some(service_name) = extract_service_name(x) {
+                    instance_path.child(service_name);
+                }
+            }
         }
-
-        let mut path_builder = VecDeque::new();
-        values.iter_values().for_each(|v| {
-            parse_roblox_expression(v, &mut path_builder, &mut current_path).ok();
+        values_iter.for_each(|expression| {
+            if let Expression::String(x) = expression {
+                instance_path.child(x.get_value().to_string());
+            }
         });
-        while let Some(x) = path_builder.pop_back() {
-            current_path.push(x);
-        }
 
-        pathdiff::diff_paths(current_path, PathBuf::from("./"))
+        if let Some(ref sourcemap) = self.cached_sourcemap {
+            if let Some(file_path) = sourcemap.get_file_path(instance_path) {
+				return Some(file_path);
+            }
+        };
+
+        None
     }
 }
 
-fn parse_roblox_call(call: &FunctionCall, current_path: &mut PathBuf) -> DarkluaResult<()> {
-    match call.get_prefix() {
-        Prefix::Field(field) => {
-            match field.get_prefix() {
-                Prefix::Identifier(x) if x.get_name() == "TS" && x.get_token().is_none() => {}
-                _ => {
-                    return Err(
-                        DarkluaError::custom("expected call to be apart of the TS module")
-                            .context("while parsing roblox-ts require"),
-                    )?
-                }
-            };
-            if !(field.get_field().get_name() == "getModule"
-                && field.get_field().get_token().is_none())
-            {
-                return Err(DarkluaError::custom("expected call to be TS.getModule")
-                    .context("while parsing roblox-ts require"));
+fn get_relative_parent_path(path: &Path) -> &Path {
+    match path.parent() {
+        Some(parent) => {
+            if parent == Path::new("") {
+                Path::new(".")
+            } else {
+                parent
             }
         }
-        _ => return Err(DarkluaError::custom("a"))?,
+        None => Path::new(".."),
+    }
+}
+
+fn extract_service_name(call: &FunctionCall) -> Option<String> {
+    let Some(field) = call.get_method() else {
+        return None;
     };
 
-    let mut temp_path = PathBuf::from("node_modules");
+    let Prefix::Identifier(identifier) = call.get_prefix() else {
+        return None;
+    };
+
+    if identifier.get_name() != "game" {
+        return None;
+    }
+
+    if field.get_name() != "GetService" {
+        return None;
+    }
+
     let Arguments::Tuple(args) = call.get_arguments() else {
-        return Err(DarkluaError::custom(
-            "expected call arguments for TS.getModule to be a tuple",
-        )
-        .context("while parsing roblox-ts require"))?;
+        return None;
     };
-    args.iter_values().for_each(|arg| {
-        if let Expression::String(x) = arg {
-            temp_path.push(x.get_value())
-        }
-    });
 
-    let _ = temp_path.join(&current_path);
-    *current_path = temp_path;
-    Ok(())
-}
+    if args.iter_values().count() != 1 {
+        return None;
+    }
 
-fn parse_roblox_prefix(
-    prefix: &Prefix,
-    path_builder: &mut VecDeque<String>,
-    current_path: &mut PathBuf,
-) -> DarkluaResult<()> {
-    match prefix {
-        Prefix::Field(x) => parse_roblox_field(x, path_builder, current_path)?,
-        Prefix::Identifier(x) => {
-            handle_roblox_script_parent(x.get_name(), path_builder, current_path)?
-        }
-        Prefix::Call(x) => parse_roblox_call(x, current_path)?,
-        _ => Err(
-            DarkluaError::custom("unexpected prefix, only constants accepted")
-                .context("while parsing roblox require"),
-        )?,
+    let Some(first_arg) = args.iter_values().next() else {
+        return None;
     };
-    Ok(())
-}
 
-fn parse_roblox_expression(
-    expression: &Expression,
-    path_builder: &mut VecDeque<String>,
-    current_path: &mut PathBuf,
-) -> DarkluaResult<()> {
-    match expression {
-        Expression::Field(x) => parse_roblox_field(x, path_builder, current_path)?,
-        Expression::Identifier(x) => {
-            handle_roblox_script_parent(x.get_name(), path_builder, current_path)?
-        }
-        Expression::String(x) => {
-            handle_roblox_script_parent(x.get_value(), path_builder, current_path)?
-        }
-        Expression::Call(x) => parse_roblox_call(x, current_path)?,
-        _ => Err(
-            DarkluaError::custom("unexpected expression, only constants accepted")
-                .context("while parsing roblox require"),
-        )?,
+    let Expression::String(service_name) = first_arg else {
+        return None;
     };
-    Ok(())
-}
 
-fn parse_roblox_field(
-    field: &FieldExpression,
-    path_builder: &mut VecDeque<String>,
-    current_path: &mut PathBuf,
-) -> DarkluaResult<()> {
-    parse_roblox_prefix(field.get_prefix(), path_builder, current_path)?;
-    handle_roblox_script_parent(field.get_field().get_name(), path_builder, current_path)
-}
-
-fn handle_roblox_script_parent(
-    str: &str,
-    path_builder: &mut VecDeque<String>,
-    current_path: &mut PathBuf,
-) -> DarkluaResult<()> {
-    match str {
-        "script" => {}
-        "Parent" => {
-            current_path.pop();
-        }
-        x => path_builder.push_front(x.to_string()),
-    };
-    Ok(())
+    Some(service_name.get_value().to_string())
 }

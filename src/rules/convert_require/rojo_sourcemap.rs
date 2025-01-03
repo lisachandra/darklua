@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{utils, DarkluaError};
 
+use crate::rules::convert_require::instance_path::InstancePathComponent;
+
 use super::InstancePath;
 
 type NodeId = usize;
@@ -179,6 +181,27 @@ impl RojoSourcemap {
                 target_ancestors.iter().rev().skip(1),
             )
         }
+    }
+
+    pub(crate) fn get_file_path(&self, instance_path: InstancePath) -> Option<PathBuf> {
+        let mut node = &self.root_node;
+        if self.is_datamodel {
+            node = &self.root_node;
+        }
+        let target_node = instance_path.get_components().iter().fold(
+            Some(node),
+            |node, component| match component {
+                InstancePathComponent::Child(child_name) => {
+                    node.and_then(|node| node.children.iter().find(|x| &x.name == child_name))
+                }
+                InstancePathComponent::Parent => None,
+            },
+        );
+
+        let target_node = target_node?;
+
+        let path = target_node.file_paths.first()?.clone();
+        Some(path)
     }
 
     fn index_descendants<'a>(

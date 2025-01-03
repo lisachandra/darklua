@@ -103,8 +103,13 @@ impl Bundler {
 
 impl Rule for Bundler {
     fn process(&self, block: &mut Block, context: &Context) -> RuleProcessResult {
-        self.require_mode
-            .process_block(block, context, &self.options)
+        let mut require_mode = self.require_mode.clone();
+        if let BundleRequireMode::Hybrid(hybrid_mode) = &mut require_mode {
+            hybrid_mode
+                .initialize(context)
+                .expect("unable to initialize hybrid require mode");
+        }
+        require_mode.process_block(block, context, &self.options)
     }
 }
 

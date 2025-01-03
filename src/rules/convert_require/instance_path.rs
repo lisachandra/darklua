@@ -62,6 +62,10 @@ impl InstancePath {
 
         prefix
     }
+
+	pub(crate) fn get_components(&self) -> &Vec<InstancePathComponent> {
+        &self.components
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
