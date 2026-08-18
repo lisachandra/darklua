@@ -1,7 +1,7 @@
-mod instance_path;
+pub mod instance_path;
 mod roblox_index_style;
 mod roblox_require_mode;
-mod rojo_sourcemap;
+pub mod rojo_sourcemap;
 
 use serde::{Deserialize, Serialize};
 
@@ -15,7 +15,7 @@ use crate::rules::{
 
 use instance_path::InstancePath;
 pub use roblox_index_style::RobloxIndexStyle;
-pub use roblox_require_mode::RobloxRequireMode;
+pub use roblox_require_mode::{parse_roblox, RobloxRequireMode};
 
 use super::{verify_required_properties, PathRequireMode, Rule, RuleProcessResult};
 use crate::rules::require::LuauRequireMode;

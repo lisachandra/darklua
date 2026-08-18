@@ -1,5 +1,7 @@
 use std::str::FromStr;
 
+use crate::rules::require::HybridRequireMode;
+
 use serde::{Deserialize, Serialize};
 
 use crate::rules::{
@@ -8,13 +10,14 @@ use crate::rules::{
 };
 use crate::{nodes::Block, rules::Context};
 
-use super::{path_require_mode, BundleOptions};
+use super::{hybrid_require_mode, path_require_mode, BundleOptions};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields, rename_all = "snake_case", tag = "name")]
 pub enum BundleRequireMode {
     Path(PathRequireMode),
     Luau(LuauRequireMode),
+    Hybrid(HybridRequireMode),
 }
 
 impl From<PathRequireMode> for BundleRequireMode {
@@ -23,6 +26,13 @@ impl From<PathRequireMode> for BundleRequireMode {
     }
 }
 
+impl From<HybridRequireMode> for BundleRequireMode {
+    fn from(mode: HybridRequireMode) -> Self {
+        Self::Hybrid(mode)
+    }
+}
+
+
 impl FromStr for BundleRequireMode {
     type Err = String;
 
@@ -30,6 +40,7 @@ impl FromStr for BundleRequireMode {
         Ok(match s {
             "path" => Self::Path(Default::default()),
             "luau" => Self::Luau(Default::default()),
+            "hybrid" => Self::Hybrid(Default::default()),
             _ => return Err(format!("invalid require mode `{}`", s)),
         })
     }
@@ -63,6 +74,15 @@ impl BundleRequireMode {
 
                 path_require_mode::process_block(block, context, options, locator)
             }
+            Self::Hybrid(hybrid_require_mode) => {
+                let mut require_mode = hybrid_require_mode.clone();
+                require_mode
+                    .initialize(context)
+                    .map_err(|err| err.to_string())?;
+
+                hybrid_require_mode::process_block(block, context, options, &require_mode)
+            }
+
             Self::Luau(luau_require_mode) => {
                 let mut require_mode = luau_require_mode.clone();
                 require_mode

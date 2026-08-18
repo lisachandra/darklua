@@ -32,6 +32,11 @@ impl InstancePath {
             .push(InstancePathComponent::Child(child_name.into()));
     }
 
+    pub(crate) fn get_components(&self) -> &Vec<InstancePathComponent> {
+        &self.components
+    }
+
+
     pub(crate) fn convert(&self, index_style: &RobloxIndexStyle) -> Prefix {
         let mut components_iter = self.components.iter();
 

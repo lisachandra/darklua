@@ -77,8 +77,14 @@ impl<'a, 'b, 'resources, PathLocatorImpl: PathLocator + Clone>
     }
 
     fn require_call(&self, call: &FunctionCall) -> Option<PathBuf> {
+        // First check for custom require calls (e.g., TS.import, Roblox requires)
+        if let Some(path) = self.path_locator.resolve_require_call(call, &self.source) {
+            return Some(path);
+        }
+
         if is_require_call(call, self) {
             match_path_require_call(call)
+                .or_else(|| self.path_locator.resolve_require_path(call, &self.source))
         } else {
             None
         }

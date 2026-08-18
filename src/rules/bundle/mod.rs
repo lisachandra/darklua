@@ -1,4 +1,6 @@
 pub(crate) mod path_require_mode;
+pub(crate) mod hybrid_require_mode;
+
 mod rename_type_declaration;
 mod require_mode;
 
