@@ -9,6 +9,27 @@ use env_logger::Builder;
 use log::Level;
 
 fn main() {
+    // Bundling a large project inlines requires recursively, so the depth of the
+    // call stack scales with the module graph, not with anything the caller can
+    // bound. The main thread's stack is 1 MiB on Windows and 8 MiB on Linux, which
+    // is not enough for a project of a few hundred modules: the bundler overflowed
+    // partway through. Run the CLI on a thread with a stack large enough that the
+    // graph depth stops being the limit.
+    const STACK_SIZE: usize = 256 * 1024 * 1024;
+
+    let worker = std::thread::Builder::new()
+        .name("darklua".to_owned())
+        .stack_size(STACK_SIZE)
+        .spawn(run)
+        .expect("unable to spawn the darklua worker thread");
+
+    match worker.join() {
+        Ok(()) => {}
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
+fn run() {
     let darklua = Darklua::parse();
 
     let filter = darklua.get_log_level_filter();

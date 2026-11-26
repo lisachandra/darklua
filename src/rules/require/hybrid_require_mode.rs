@@ -9,7 +9,8 @@ use crate::{
     rules::{
         convert_require::{instance_path::InstancePath, rojo_sourcemap::RojoSourcemap},
         parse_roblox, Context,
-    }, DarkluaError,
+    },
+    utils, DarkluaError,
 };
 
 use super::PathRequireMode;
@@ -60,22 +61,28 @@ impl HybridRequireMode {
 }
 
 impl HybridRequireMode {
-
-
     pub(crate) fn path_require_mode(&self) -> &PathRequireMode {
         &self.path_require_mode
     }
 
-    pub(crate) fn resolve_require_call(&self, call: &FunctionCall, source: &Path) -> Option<PathBuf> {
+    pub(crate) fn resolve_require_call(
+        &self,
+        call: &FunctionCall,
+        source: &Path,
+    ) -> Option<PathBuf> {
         self.resolve_ts_import(call, source)
             .or_else(|| self.resolve_roblox_require(call, source))
     }
 
-    pub(crate) fn resolve_require_path(&self, call: &FunctionCall, source: &Path) -> Option<PathBuf> {
+    pub(crate) fn resolve_require_path(
+        &self,
+        call: &FunctionCall,
+        source: &Path,
+    ) -> Option<PathBuf> {
         self.resolve_roblox_require(call, source)
     }
 
-    fn resolve_ts_import(&self, call: &FunctionCall, _source: &Path) -> Option<PathBuf> {
+    fn resolve_ts_import(&self, call: &FunctionCall, source: &Path) -> Option<PathBuf> {
         if !self.convert_ts_imports {
             return None;
         }
@@ -101,14 +108,28 @@ impl HybridRequireMode {
         let mut values_iter = values.iter_values();
         values_iter.next();
 
-        let mut instance_path = InstancePath::from_root();
-        if let Some(service_name_expression) = values_iter.next() {
-            if let Expression::Call(x) = service_name_expression {
-                if let Some(service_name) = extract_service_name(x) {
-                    instance_path.child(service_name);
+        // The second argument is either a service (`game:GetService("X")`) or a
+        // script-relative expression such as `script.Parent.Parent`. Anything else
+        // means the path cannot be located, so resolving it would produce a wrong
+        // answer rather than no answer.
+        let mut instance_path = match values_iter.next() {
+            Some(Expression::Call(call)) => match extract_service_name(call) {
+                Some(service_name) => {
+                    let mut path = InstancePath::from_root();
+                    path.child(service_name);
+                    path
                 }
+                None => return None,
+            },
+            Some(expression) => {
+                // `script`, `script.Parent`, `TS.getModule(...)` are handled by
+                // other rules, so bail out instead of guessing.
+                let _ = expression;
+                return None;
             }
-        }
+            None => InstancePath::from_root(),
+        };
+
         values_iter.for_each(|expression| {
             if let Expression::String(x) = expression {
                 instance_path.child(x.get_string_value().unwrap_or_default());
@@ -117,7 +138,7 @@ impl HybridRequireMode {
 
         if let Some(ref sourcemap) = self.cached_sourcemap {
             if let Some(file_path) = sourcemap.get_file_path(instance_path) {
-                return Some(file_path);
+                return self.to_require_path(&file_path, source);
             }
         };
 
@@ -125,19 +146,128 @@ impl HybridRequireMode {
     }
 
     fn resolve_roblox_require(&self, call: &FunctionCall, source: &Path) -> Option<PathBuf> {
+        if !is_bare_require_call(call) {
+            return None;
+        }
         parse_roblox(call, source)
             .ok()
             .flatten()
-            .and_then(|x| {
-                let mut source_parent = source.to_path_buf();
-                source_parent.pop();
-                pathdiff::diff_paths(x, source_parent).map(|x| PathBuf::from("./").join(x))
-            })
+            .and_then(|x| self.to_require_path(&x, source))
+    }
+
+    /// Decide the path form to hand to `PathLocator::find_require_path`.
+    ///
+    /// A target already rooted at a configured source alias (for example
+    /// `out/...` or `node_modules/...`) is returned unchanged. Two things depend
+    /// on that form:
+    ///
+    /// - `find_require_path` joins an alias-prefixed path against the project
+    ///   location, which is how the alias is meant to resolve.
+    /// - `BundleOptions::is_excluded` matches its globs against this same value.
+    ///   Those globs (`node_modules/**`, `out/test/**`) are written
+    ///   project-relative, so rewriting the path first silently stops them from
+    ///   matching and vendored code gets inlined and re-parsed instead of being
+    ///   left as a runtime require.
+    ///
+    /// Anything not anchored by an alias (workspace packages reached through
+    /// `../..`, for instance) is re-expressed relative to the requiring file,
+    /// because `find_require_path` would otherwise read its first component as an
+    /// unknown source name.
+    fn to_require_path(&self, target: &Path, source: &Path) -> Option<PathBuf> {
+        if let Some(root) = target.components().next() {
+            if let Some(name) = root.as_os_str().to_str() {
+                if self
+                    .path_require_mode
+                    .get_source(name, Path::new(""))
+                    .is_some()
+                {
+                    return Some(target.to_path_buf());
+                }
+            }
+        }
+
+        rebase_to_source(target, source)
     }
 }
 
+/// Re-express a project-relative path so it can be handed to
+/// `PathLocator::find_require_path`.
+///
+/// Both the Rojo sourcemap and `parse_roblox` hand back paths anchored at the
+/// project location, but `find_require_path` resolves a leading `.` against the
+/// *requiring file* (`source`) and treats anything else as an alias name. A
+/// project-relative path fed in unchanged therefore resolves to the wrong place:
+/// `packages/@internal/tether/out/init.luau` becomes "unknown source name
+/// `packages`", and a path that walks above the project root gets appended to
+/// the requiring file's directory.
+///
+/// The diff is computed component by component rather than with `pathdiff`.
+/// Given two relative paths, `pathdiff::diff_paths` can emit a path like
+/// `packages/../../../..` (it anchors on the target's first component instead of
+/// counting the base's depth), which normalizes to the wrong directory. Walking
+/// the components directly keeps both sides in the same project-relative
+/// coordinate system, so the `..` count always matches the base's real depth.
+fn rebase_to_source(target: &Path, source: &Path) -> Option<PathBuf> {
+    let mut source_parent = source.to_path_buf();
+    source_parent.pop();
+    let base = utils::normalize_path(&source_parent);
+    let target = utils::normalize_path(target);
 
+    // An absolute target cannot be expressed relative to a relative base (and
+    // vice versa): the two would resolve against different anchors.
+    if base.has_root() != target.has_root() {
+        return None;
+    }
 
+    let base_components: Vec<_> = base.components().collect();
+    let target_components: Vec<_> = target.components().collect();
+
+    let common = base_components
+        .iter()
+        .zip(target_components.iter())
+        .take_while(|(left, right)| left == right)
+        .count();
+
+    let mut relative = PathBuf::new();
+    for _ in common..base_components.len() {
+        relative.push("..");
+    }
+    for component in &target_components[common..] {
+        relative.push(component.as_os_str());
+    }
+
+    if relative.as_os_str().is_empty() {
+        relative.push(".");
+    }
+
+    Some(PathBuf::from("./").join(relative))
+}
+
+/// Returns true only for a bare `require(...)` call.
+///
+/// `parse_roblox` treats a call's first argument as an instance path, so without
+/// this guard any call whose first argument is a field expression -- for example
+/// `options.spawnSound` or `applyPartVisual(part, original, options)` -- is
+/// mis-read as a Roblox require. The bundler then tries to resolve a path built
+/// out of the argument's field names (`...\spawnSound\options`) and fails.
+///
+/// The resolver runs before `is_require_call`, so it must screen the callee
+/// itself. Shadowing is not considered here: a local named `require` is rare
+/// enough that the structural check is the right trade for a resolver, and the
+/// bundle rule still applies `is_require_call` (with its tracker) before
+/// inlining.
+fn is_bare_require_call(call: &FunctionCall) -> bool {
+    if call.get_method().is_some() {
+        return false;
+    }
+
+    match call.get_prefix() {
+        Prefix::Identifier(identifier) => {
+            identifier.get_name() == "require" && identifier.get_token().is_none()
+        }
+        _ => false,
+    }
+}
 
 fn get_relative_parent_path(path: &Path) -> &Path {
     match path.parent() {
@@ -185,5 +315,10 @@ fn extract_service_name(call: &FunctionCall) -> Option<String> {
         return None;
     };
 
-    Some(service_name.get_string_value().unwrap_or_default().to_string())
+    Some(
+        service_name
+            .get_string_value()
+            .unwrap_or_default()
+            .to_string(),
+    )
 }

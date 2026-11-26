@@ -4,7 +4,8 @@ use std::{
 };
 
 use super::{path_iterator, PathRequireMode};
-use crate::{rules::require::path_utils::is_require_relative, utils, DarkluaError, Resources};
+use crate::rules::require::path_utils::{get_relative_parent_path, is_require_relative};
+use crate::{utils, DarkluaError, Resources};
 
 #[derive(Clone, Debug)]
 pub(crate) struct RequirePathLocator<'a, 'resources> {
@@ -66,16 +67,32 @@ impl super::PathLocator for RequirePathLocator<'_, '_> {
                 ))
             })?;
 
-            let mut extra_module_location = require_mode
-                .get_source(source_name, self.extra_module_relative_location)
-                .ok_or_else(|| {
-                    DarkluaError::invalid_resource_path(
-                        path.display().to_string(),
-                        format!("unknown source name `{}`", source_name),
-                    )
-                })?;
-            extra_module_location.extend(components);
-            path = extra_module_location;
+            if source_name == "@self" {
+                // Vendored Luau packages (for example `@rbxts/cryptography`) use the
+                // Luau require-mode `@self` alias. The Luau locator resolves it, but
+                // this locator did not, so path-mode bundling of such a package failed
+                // with "unknown source name `@self`". Mirror the Luau locator exactly:
+                // `@self/Child` is `Child` in the requiring file's directory. Note the
+                // Luau locator applies its extra `init`-module parent hop only to the
+                // `./` form, not to `@self`, so this must not add one either.
+                path = get_relative_parent_path(source).join(components);
+                log::trace!(
+                    "resolved `@self` require from `{}` to `{}`",
+                    source.display(),
+                    path.display()
+                );
+            } else {
+                let mut extra_module_location = require_mode
+                    .get_source(source_name, self.extra_module_relative_location)
+                    .ok_or_else(|| {
+                        DarkluaError::invalid_resource_path(
+                            path.display().to_string(),
+                            format!("unknown source name `{}`", source_name),
+                        )
+                    })?;
+                extra_module_location.extend(components);
+                path = extra_module_location;
+            }
         }
         // else: the path is absolute so darklua should attempt to require it directly
 

@@ -904,4 +904,135 @@ data:
             process_main_with_error(&resources, "two_different_direct_cycles");
         }
     }
+
+    /// Regressions found while bundling a large Rojo project with the hybrid
+    /// require mode.
+    mod hybrid_require_mode {
+        use super::*;
+
+        const DARKLUA_BUNDLE_ONLY_READABLE_CONFIG_HYBRID: &str =
+            r#"{ "rules": [], "generator": "readable", "bundle": { "require_mode": "hybrid" } }"#;
+
+        /// A call whose first argument is a field expression is not a require.
+        ///
+        /// The hybrid resolver runs before `is_require_call`, and `parse_roblox`
+        /// reads the first argument as an instance path. Without screening the
+        /// callee, `applyPartVisual(options.spawnSound, options.model)` was treated
+        /// as a Roblox require: the resolver built a path out of the argument's
+        /// field names (`<source>/spawnSound/options`) and the bundle failed trying
+        /// to find it. Path mode never showed this because it does not consult the
+        /// resolver first.
+        ///
+        /// The first argument has to be a field expression for this to bite. An
+        /// identifier there is rejected by `parse_roblox` on its own, which is why
+        /// a call like `f(part, options.spawnSound)` does not reproduce it.
+        #[test]
+        fn non_require_calls_with_field_arguments_are_not_resolved() {
+            let resources = memory_resources!(
+                "src/main.lua" => concat!(
+                    "local options = { spawnSound = { sound = 1 }, model = {} }\n",
+                    "applyPartVisual(options.spawnSound, options.model)\n",
+                    "local sound = options.spawnSound\n",
+                ),
+                ".darklua.json" => DARKLUA_BUNDLE_ONLY_READABLE_CONFIG_HYBRID,
+            );
+
+            process(
+                &resources,
+                Options::new("src/main.lua").with_output("out.lua"),
+            )
+            .unwrap()
+            .result()
+            .unwrap();
+
+            let out = resources.get("out.lua").unwrap();
+            assert!(
+                out.contains("applyPartVisual"),
+                "the non-require call should have been left alone, got:\n{}",
+                out
+            );
+        }
+
+        /// `@self/Child` is the Luau alias for a sibling module. Vendored Luau
+        /// packages use it even when the project bundles in path mode, so path mode
+        /// has to resolve it instead of reporting an unknown source name.
+        #[test]
+        fn self_alias_resolves_to_sibling_module() {
+            let resources = memory_resources!(
+                "src/init.luau" => "return { child = require('@self/Child') }",
+                "src/Child.luau" => "return 'child'",
+                "main.luau" => "local root = require('./src')",
+                ".darklua.json" => DARKLUA_BUNDLE_ONLY_READABLE_CONFIG,
+            );
+
+            process(&resources, Options::new("main.luau").with_output("out.lua"))
+                .unwrap()
+                .result()
+                .unwrap();
+
+            let out = resources.get("out.lua").unwrap();
+            assert!(
+                out.contains("'child'"),
+                "the @self alias should have been bundled, got:\n{}",
+                out
+            );
+        }
+
+        /// An integer literal that does not fit in a 64-bit integer is a valid
+        /// Luau float, so it must parse rather than fail the bundle.
+        #[test]
+        fn oversized_hex_literal_parses_as_float() {
+            let resources = memory_resources!(
+                "src/main.lua" => "return 0x1_0000_0000_0000_0000",
+                ".darklua.json" => DARKLUA_BUNDLE_ONLY_READABLE_CONFIG,
+            );
+
+            process(
+                &resources,
+                Options::new("src/main.lua").with_output("out.lua"),
+            )
+            .unwrap()
+            .result()
+            .unwrap();
+
+            let out = resources.get("out.lua").unwrap();
+            assert!(
+                !out.is_empty(),
+                "an oversized hex literal should bundle as a number"
+            );
+        }
+
+        /// A `TS.import` whose base is script-relative instead of a service must not
+        /// be resolved through the sourcemap.
+        ///
+        /// `TS.import(script, script.Parent.Parent, "components")` names a sibling
+        /// module. The previous code only recognised a `game:GetService(...)` base
+        /// and silently left the instance path empty for anything else, which the
+        /// sourcemap then resolved to the project *root* -- so the bundle tried to
+        /// inline `default.project.json`. These calls have to be left alone.
+        #[test]
+        fn ts_import_with_script_relative_base_is_not_resolved() {
+            let resources = memory_resources!(
+                "src/main.lua" => concat!(
+                    "local isComponent = TS.import(script, script.Parent.Parent, 'components')\n",
+                ),
+                ".darklua.json" => DARKLUA_BUNDLE_ONLY_READABLE_CONFIG_HYBRID,
+            );
+
+            process(
+                &resources,
+                Options::new("src/main.lua").with_output("out.lua"),
+            )
+            .unwrap()
+            .result()
+            .unwrap();
+
+            let out = resources.get("out.lua").unwrap();
+            assert!(
+                out.contains("TS.import"),
+                "the script-relative TS.import should have been left alone, got:\n{}",
+                out
+            );
+        }
+    }
 }

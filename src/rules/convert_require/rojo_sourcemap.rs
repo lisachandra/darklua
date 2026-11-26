@@ -237,10 +237,22 @@ impl RojoSourcemap {
 
         let target_node = target_node?;
 
-        let path = target_node.file_paths.first()?.clone();
-        Some(path)
+        // A node can list several paths: an `init` module and the project file that
+        // describes it, for instance. Only one of them is bundleable source, and
+        // which one comes first is not guaranteed, so pick the script explicitly
+        // instead of taking the first entry.
+        target_node
+            .file_paths
+            .iter()
+            .find(|path| {
+                matches!(
+                    path.extension().and_then(|extension| extension.to_str()),
+                    Some("lua" | "luau")
+                )
+            })
+            .or_else(|| target_node.file_paths.first())
+            .cloned()
     }
-
 
     fn find_node(&self, path: &Path) -> Option<&RojoSourcemapNode> {
         self.root_node

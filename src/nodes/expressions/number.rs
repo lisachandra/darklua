@@ -440,6 +440,37 @@ fn filter_underscore(number: &str) -> String {
     number.chars().filter(|c| c != &'_').collect()
 }
 
+/// Converts a string of digits in `radix` into a float, for literals too large
+/// for `u64`.
+///
+/// Luau evaluates an oversized integer literal as a double rather than
+/// rejecting it: `0x1_0000_0000_0000_0000` is 2^64, one past `u64::MAX`, and is
+/// perfectly valid in Luau source. `HexNumber` and `BinaryNumber` store a
+/// `u64`, so such a literal has to be represented as a decimal number instead
+/// of being a parse error. Folding digits into an `f64` reproduces the value
+/// Luau computes, including for magnitudes well beyond 2^64.
+fn digits_to_float(digits: &str, radix: u32) -> Result<f64, NumberParsingError> {
+    if digits.is_empty() {
+        return Err(match radix {
+            16 => NumberParsingError::InvalidHexadecimalNumber,
+            _ => NumberParsingError::InvalidBinaryNumber,
+        });
+    }
+
+    let radix = f64::from(radix);
+    let mut value = 0.0_f64;
+
+    for c in digits.chars() {
+        let digit = c.to_digit(radix as u32).ok_or(match radix as u32 {
+            16 => NumberParsingError::InvalidHexadecimalNumber,
+            _ => NumberParsingError::InvalidBinaryNumber,
+        })?;
+        value = value * radix + f64::from(digit);
+    }
+
+    Ok(value)
+}
+
 impl FromStr for NumberExpression {
     type Err = NumberParsingError;
 
@@ -471,20 +502,27 @@ impl FromStr for NumberExpression {
 
                         HexNumber::new(number, is_uppercase)
                             .with_exponent(exponent, exponent_is_uppercase)
+                            .into()
                     } else {
                         let filtered = filter_underscore(value.get(position + 1..).unwrap());
-                        let number = u64::from_str_radix(&filtered, 16)
-                            .map_err(|_| Self::Err::InvalidHexadecimalNumber)?;
-
-                        HexNumber::new(number, is_uppercase)
+                        // Luau evaluates an integer literal that does not fit in a
+                        // 64-bit integer as a float, so fall back to that instead of
+                        // failing the parse.
+                        match u64::from_str_radix(&filtered, 16) {
+                            Ok(number) => HexNumber::new(number, is_uppercase).into(),
+                            Err(_) => NumberExpression::Decimal(DecimalNumber::new(
+                                digits_to_float(&filtered, 16)?,
+                            )),
+                        }
                     }
-                    .into()
                 } else if notation == 'b' || notation == 'B' {
                     let filtered = filter_underscore(value.get(position + 1..).unwrap());
-                    let number = u64::from_str_radix(&filtered, 2)
-                        .map_err(|_| Self::Err::InvalidBinaryNumber)?;
-
-                    BinaryNumber::new(number, is_uppercase).into()
+                    match u64::from_str_radix(&filtered, 2) {
+                        Ok(number) => BinaryNumber::new(number, is_uppercase).into(),
+                        Err(_) => NumberExpression::Decimal(DecimalNumber::new(digits_to_float(
+                            &filtered, 2,
+                        )?)),
+                    }
                 } else {
                     unreachable!()
                 }
