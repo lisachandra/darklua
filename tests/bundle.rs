@@ -1013,9 +1013,7 @@ data:
         #[test]
         fn ts_import_with_script_relative_base_is_not_resolved() {
             let resources = memory_resources!(
-                "src/main.lua" => concat!(
-                    "local isComponent = TS.import(script, script.Parent.Parent, 'components')\n",
-                ),
+                "src/main.lua" => "local isComponent = TS.import(script, script.Parent.Parent, 'components')\n",
                 ".darklua.json" => DARKLUA_BUNDLE_ONLY_READABLE_CONFIG_HYBRID,
             );
 

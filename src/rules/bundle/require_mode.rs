@@ -32,7 +32,6 @@ impl From<HybridRequireMode> for BundleRequireMode {
     }
 }
 
-
 impl FromStr for BundleRequireMode {
     type Err = String;
 

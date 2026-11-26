@@ -273,7 +273,6 @@ fn parse_roblox_prefix(
             handle_roblox_script_parent(x.get_name(), path_builder, current_path)?
         }
         _ => Err(
-
             DarkluaError::custom("unexpected prefix, only constants accepted")
                 .context("while parsing roblox require"),
         )?,
@@ -292,9 +291,11 @@ fn parse_roblox_expression(
         Expression::Identifier(x) => {
             handle_roblox_script_parent(x.get_name(), path_builder, current_path)?
         }
-        Expression::String(x) => {
-            handle_roblox_script_parent(x.get_string_value().unwrap_or_default(), path_builder, current_path)?
-        }
+        Expression::String(x) => handle_roblox_script_parent(
+            x.get_string_value().unwrap_or_default(),
+            path_builder,
+            current_path,
+        )?,
         _ => Err(
             DarkluaError::custom("unexpected expression, only constants accepted")
                 .context("while parsing roblox require"),
@@ -346,4 +347,3 @@ fn handle_roblox_script_parent(
     };
     Ok(())
 }
-

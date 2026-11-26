@@ -113,20 +113,14 @@ impl HybridRequireMode {
         // means the path cannot be located, so resolving it would produce a wrong
         // answer rather than no answer.
         let mut instance_path = match values_iter.next() {
-            Some(Expression::Call(call)) => match extract_service_name(call) {
-                Some(service_name) => {
-                    let mut path = InstancePath::from_root();
-                    path.child(service_name);
-                    path
-                }
-                None => return None,
-            },
-            Some(expression) => {
-                // `script`, `script.Parent`, `TS.getModule(...)` are handled by
-                // other rules, so bail out instead of guessing.
-                let _ = expression;
-                return None;
+            Some(Expression::Call(call)) => {
+                let mut path = InstancePath::from_root();
+                path.child(extract_service_name(call)?);
+                path
             }
+            // `script`, `script.Parent`, `TS.getModule(...)` are handled by
+            // other rules, so bail out instead of guessing.
+            Some(_) => return None,
             None => InstancePath::from_root(),
         };
 
@@ -283,9 +277,7 @@ fn get_relative_parent_path(path: &Path) -> &Path {
 }
 
 fn extract_service_name(call: &FunctionCall) -> Option<String> {
-    let Some(field) = call.get_method() else {
-        return None;
-    };
+    let field = call.get_method()?;
 
     let Prefix::Identifier(identifier) = call.get_prefix() else {
         return None;
@@ -303,13 +295,11 @@ fn extract_service_name(call: &FunctionCall) -> Option<String> {
         return None;
     };
 
-    if args.iter_values().count() != 1 {
+    let mut args_iter = args.iter_values();
+    let first_arg = args_iter.next()?;
+    if args_iter.next().is_some() {
         return None;
     }
-
-    let Some(first_arg) = args.iter_values().next() else {
-        return None;
-    };
 
     let Expression::String(service_name) = first_arg else {
         return None;

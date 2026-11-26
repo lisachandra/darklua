@@ -36,7 +36,6 @@ impl InstancePath {
         &self.components
     }
 
-
     pub(crate) fn convert(&self, index_style: &RobloxIndexStyle) -> Prefix {
         let mut components_iter = self.components.iter();
 

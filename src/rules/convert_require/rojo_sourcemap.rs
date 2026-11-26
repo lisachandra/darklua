@@ -225,11 +225,11 @@ impl RojoSourcemap {
         if self.is_datamodel {
             node = &self.root_node;
         }
-        let target_node = instance_path.get_components().iter().fold(
-            Some(node),
+        let target_node = instance_path.get_components().iter().try_fold(
+            node,
             |node, component| match component {
                 InstancePathComponent::Child(child_name) => {
-                    node.and_then(|node| node.children.iter().find(|x| &x.name == child_name))
+                    node.children.iter().find(|x| &x.name == child_name)
                 }
                 InstancePathComponent::Parent => None,
             },
