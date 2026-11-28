@@ -2,7 +2,7 @@
 name = "darklua"
 # This is a fork of Stefanuk12/darklua with hybrid require mode and TS.import support
 
-version = "0.19.1"
+version = "0.19.2"
 authors = ["jeparlefrancais <jeparlefrancais21@gmail.com>"]
 edition = "2018"
 readme = "README.md"
