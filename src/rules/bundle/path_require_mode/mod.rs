@@ -90,9 +90,46 @@ impl<'a, 'b, 'resources, PathLocatorImpl: PathLocator + Clone>
         }
     }
 
+    /// Decides whether a resolved path stays a runtime require instead of being inlined.
+    ///
+    /// Two independent signals are checked.
+    ///
+    /// The configured exclude globs are matched first, against the resolved path and
+    /// against a project-relative spelling of it: a resolved path may be rebased to the
+    /// requiring file (`./../..`), which no project-relative glob can match.
+    ///
+    /// Then the locator is asked whether the file is a dependency. This is the reliable
+    /// signal for vendored and workspace packages, because a path glob cannot identify
+    /// them: workspace links are junctions on Windows and symlinks elsewhere, so
+    /// `packages/@lisachandra/core/out/logger.luau` and
+    /// `../../Packages/rbxts/packages/core/out/logger.luau` are the same file under two
+    /// names. Whichever spelling the resolver produced, the instance tree still mounts
+    /// the module under a `node_modules` folder, and project code never is.
+    fn is_excluded(&self, require_path: &Path) -> bool {
+        if self.options.is_excluded(require_path) {
+            return true;
+        }
+
+        if self.path_locator.is_dependency(require_path) {
+            return true;
+        }
+
+        match project_relative_form(require_path, &self.source) {
+            Some(project_relative) => self.options.is_excluded(&project_relative),
+            None => false,
+        }
+    }
+
     fn try_inline_call(&mut self, call: &FunctionCall) -> Option<Expression> {
         let literal_require_path = self.require_call(call)?;
 
+        /*
+         * Exclude globs are written project-relative, but the literal path is whatever
+         * the resolver produced: a `.`-prefixed, `..`-walking path rebased onto the
+         * requiring file. Testing only that form is why no exclude pattern could stop
+         * the workspace packages from being inlined (#851). The resolved path is tested
+         * again below, where it is normalized and can be matched against the sourcemap.
+         */
         if self.options.is_excluded(&literal_require_path) {
             log::info!(
                 "exclude `{}` from bundle [from `{}`]",
@@ -118,6 +155,15 @@ impl<'a, 'b, 'resources, PathLocatorImpl: PathLocator + Clone>
             literal_require_path.display(),
             require_path.display()
         );
+
+        if self.is_excluded(&require_path) {
+            log::info!(
+                "exclude `{}` from bundle [from `{}`]",
+                require_path.display(),
+                self.source.display()
+            );
+            return None;
+        }
 
         if self.skip_module_paths.contains(&require_path) {
             log::trace!(
@@ -291,6 +337,37 @@ fn convert_expression_to_statement(expression: Expression) -> Statement {
             .with_statement(VariableAssignment::from_variable("_").with_value(expression)),
     )
     .into()
+}
+
+/// Re-express a source-relative path as project-relative.
+///
+/// The resolved path handed to `is_excluded` is relative to the *requiring file*
+/// (`HybridRequireMode::to_require_path` rebases it that way so `find_require_path`
+/// can resolve it). Undoing that means joining it back onto the requiring file's
+/// directory and normalizing the `..` runs away.
+///
+/// Returns `None` when the path is not dot-relative: an absolute path, or one already
+/// anchored at a configured source alias (`node_modules/...`, `out/...`), is already
+/// in the form the exclude globs are written against.
+fn project_relative_form(path: &Path, source: &Path) -> Option<PathBuf> {
+    if !matches!(
+        path.components().next(),
+        Some(std::path::Component::CurDir | std::path::Component::ParentDir)
+    ) {
+        return None;
+    }
+
+    /*
+     * Both sides are normalized without keeping `.` components, mirroring
+     * `rebase_to_source`. A source like `.\out\shared\network\match.luau` carries a
+     * leading `.` that would otherwise survive the join: the rebase counted four
+     * parent hops, but the un-normalized base has five components, so the result was
+     * a `.\`-prefixed path that no project-relative glob can match.
+     */
+    let mut base = crate::utils::normalize_path(source);
+    base.pop();
+
+    Some(crate::utils::normalize_path(base.join(path)))
 }
 
 pub(crate) fn process_block(

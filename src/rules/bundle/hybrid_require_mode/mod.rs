@@ -52,6 +52,10 @@ impl PathLocator for HybridPathLocator<'_, '_> {
     fn resolve_require_path(&self, call: &FunctionCall, source: &Path) -> Option<PathBuf> {
         self.hybrid_require_mode.resolve_require_path(call, source)
     }
+
+    fn is_dependency(&self, path: &Path) -> bool {
+        self.hybrid_require_mode.is_dependency(path)
+    }
 }
 
 pub(crate) fn process_block(

@@ -121,6 +121,63 @@ impl RojoSourcemap {
         self.find_node(path).is_some()
     }
 
+    /// Returns the absolute instance path of a file, from the DataModel root.
+    ///
+    /// Used to resolve `script`-relative import bases: the requiring file knows its
+    /// own place in the tree, so `script.Parent` and the names that follow can be
+    /// walked from there instead of being guessed at.
+    pub(crate) fn get_absolute_instance_path(&self, file: &Path) -> Option<InstancePath> {
+        let node = self.find_node(file)?;
+
+        let mut names = Vec::new();
+        let mut current = node;
+        loop {
+            if current.is_root() {
+                break;
+            }
+            names.push(current.name.as_str());
+            current = self.root_node.get_descendant(current.parent_id())?;
+        }
+        names.reverse();
+
+        // The DataModel node is `game` itself, not a child of it, so its name is
+        // skipped when the project describes a whole place.
+        let mut instance_path = InstancePath::from_root();
+        for name in names.iter().skip(if self.is_datamodel { 1 } else { 0 }) {
+            if !name.is_empty() {
+                instance_path.child(*name);
+            }
+        }
+
+        Some(instance_path)
+    }
+
+    /// Returns true when the given file sits under a `node_modules` node.
+    ///
+    /// This is the only reliable way to identify a dependency: the same file can be
+    /// reached through several paths because workspace links are junctions (on Windows)
+    /// or symlinks. `packages/@lisachandra` and `../../Packages/rbxts/packages` are two
+    /// names for one directory, so a glob written against the file path matches whichever
+    /// spelling the resolver happened to produce and misses the other. The instance tree
+    /// has no such ambiguity: a dependency is mounted under a `node_modules` folder, and
+    /// project code is not.
+    pub(crate) fn is_under_node_modules(&self, path: impl AsRef<Path>) -> bool {
+        // The lookup is exact, and the path handed in comes from a resolver that
+        // rebases and may leave `..` runs or a leading `.` behind, while the keys in
+        // the sourcemap were normalized when it was parsed. Normalize before matching
+        // or a genuine dependency is reported as project code and gets inlined.
+        let normalized = utils::normalize_path(path.as_ref());
+        let Some(node) = self.find_node(&normalized) else {
+            return false;
+        };
+
+        self.hierarchy(node).iter().any(|id| {
+            self.root_node
+                .get_descendant(*id)
+                .is_some_and(|ancestor| ancestor.name == "node_modules")
+        })
+    }
+
     pub(crate) fn get_instance_path(
         &self,
         from_file: impl AsRef<Path>,
@@ -429,6 +486,78 @@ mod test {
                     .unwrap(),
                 script_path(&["parent"])
             );
+        }
+    }
+
+    mod dependency_detection {
+        use super::*;
+
+        /// A file mounted under a `node_modules` node is a dependency.
+        ///
+        /// This is the signal the bundler uses to leave a package as a runtime
+        /// require (#851). It cannot be decided from the file path: workspace links
+        /// are junctions on Windows and symlinks elsewhere, so one module is reachable
+        /// under several spellings and no glob catches them all.
+        const PROJECT: &str = r#"{
+            "name": "Project",
+            "className": "DataModel",
+            "children": [
+                {
+                    "name": "ReplicatedStorage",
+                    "className": "ReplicatedStorage",
+                    "children": [
+                        { "name": "src", "className": "Folder",
+                          "children": [
+                            { "name": "own", "className": "ModuleScript",
+                              "filePaths": ["src/own.luau"] }
+                          ] },
+                        { "name": "node_modules", "className": "Folder",
+                          "children": [
+                            { "name": "lib", "className": "Folder",
+                              "children": [
+                                { "name": "init", "className": "ModuleScript",
+                                  "filePaths": ["vendor/lib/init.luau"] }
+                              ] }
+                          ] }
+                    ]
+                }
+            ]
+        }"#;
+
+        #[test]
+        fn a_module_under_node_modules_is_a_dependency() {
+            let sourcemap = new_sourcemap(PROJECT);
+
+            assert!(sourcemap.is_under_node_modules("vendor/lib/init.luau"));
+        }
+
+        #[test]
+        fn a_project_module_is_not_a_dependency() {
+            let sourcemap = new_sourcemap(PROJECT);
+
+            assert!(!sourcemap.is_under_node_modules("src/own.luau"));
+        }
+
+        /// The path arrives from a resolver that may leave a leading `.` or an interior
+        /// `./`, while sourcemap keys are normalized when the map is parsed. Matching has
+        /// to happen in one coordinate system or a real dependency reads as project code
+        /// and gets inlined.
+        #[test]
+        fn a_dot_prefixed_spelling_of_a_dependency_is_still_a_dependency() {
+            let sourcemap = new_sourcemap(PROJECT);
+
+            assert!(sourcemap.is_under_node_modules("./vendor/lib/init.luau"));
+            assert!(sourcemap.is_under_node_modules("vendor/./lib/init.luau"));
+        }
+
+        /// A file the sourcemap does not describe is not a dependency by default: an
+        /// unknown path is more likely project code than a package, and treating it as a
+        /// package would silently stop bundling real modules.
+        #[test]
+        fn an_unknown_file_is_not_a_dependency() {
+            let sourcemap = new_sourcemap(PROJECT);
+
+            assert!(!sourcemap.is_under_node_modules("src/unknown.luau"));
         }
     }
 }

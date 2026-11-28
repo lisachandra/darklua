@@ -39,4 +39,13 @@ pub(crate) trait PathLocator {
         path: impl Into<PathBuf>,
         source: &Path,
     ) -> Result<PathBuf, DarkluaError>;
+
+    /// Reports whether the path is a dependency rather than project code.
+    ///
+    /// The bundler excludes dependencies from inlining, and a path glob cannot decide
+    /// that reliably: workspace links make one file reachable under several names. A
+    /// locator backed by a Rojo sourcemap answers from the instance tree instead.
+    fn is_dependency(&self, _path: &Path) -> bool {
+        false
+    }
 }

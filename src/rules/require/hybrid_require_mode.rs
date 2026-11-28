@@ -82,6 +82,17 @@ impl HybridRequireMode {
         self.resolve_roblox_require(call, source)
     }
 
+    /// Reports whether the given file is mounted under a `node_modules` node.
+    ///
+    /// The bundler asks this before inlining. A path glob cannot answer it because
+    /// workspace links (junctions on Windows, symlinks elsewhere) make one file
+    /// reachable under several spellings, so the instance tree is the authority.
+    pub(crate) fn is_dependency(&self, path: &Path) -> bool {
+        self.cached_sourcemap
+            .as_ref()
+            .is_some_and(|sourcemap| sourcemap.is_under_node_modules(path))
+    }
+
     fn resolve_ts_import(&self, call: &FunctionCall, source: &Path) -> Option<PathBuf> {
         if !self.convert_ts_imports {
             return None;
@@ -108,19 +119,17 @@ impl HybridRequireMode {
         let mut values_iter = values.iter_values();
         values_iter.next();
 
-        // The second argument is either a service (`game:GetService("X")`) or a
-        // script-relative expression such as `script.Parent.Parent`. Anything else
-        // means the path cannot be located, so resolving it would produce a wrong
-        // answer rather than no answer.
+        // The second argument locates the module: a service (`game:GetService("X")`),
+        // a `script`-relative expression such as `script.Parent`, or nothing (the
+        // DataModel root). A `TS.getModule(...)` call names a module by scope instead
+        // of by path, so it is left alone.
         let mut instance_path = match values_iter.next() {
             Some(Expression::Call(call)) => {
                 let mut path = InstancePath::from_root();
                 path.child(extract_service_name(call)?);
                 path
             }
-            // `script`, `script.Parent`, `TS.getModule(...)` are handled by
-            // other rules, so bail out instead of guessing.
-            Some(_) => return None,
+            Some(expression) => self.resolve_script_relative(expression, source)?,
             None => InstancePath::from_root(),
         };
 
@@ -137,6 +146,60 @@ impl HybridRequireMode {
         };
 
         None
+    }
+
+    /// Resolves a `script`-relative import base into an absolute instance path.
+    ///
+    /// A package module written as `TS.import(script, script.Parent, "x")` means
+    /// "the sibling `x` of my parent". That is only meaningful while the module sits
+    /// where it was compiled; the bundler needs the absolute target so it can decide
+    /// whether to inline it at all, and so an excluded module keeps a call that still
+    /// resolves at runtime.
+    ///
+    /// The chain is read as `script` followed by any number of `.Parent` hops. Anything
+    /// else (a `TS.getModule` call, an indexed expression) has no path interpretation and
+    /// returns `None`.
+    fn resolve_script_relative(
+        &self,
+        expression: &Expression,
+        source: &Path,
+    ) -> Option<InstancePath> {
+        let mut parents = 0usize;
+        let mut current = match expression {
+            Expression::Identifier(identifier) => {
+                if identifier.get_name() != "script" {
+                    return None;
+                }
+                None
+            }
+            Expression::Field(field) => Some(field.as_ref()),
+            _ => return None,
+        };
+
+        while let Some(field) = current {
+            if field.get_field().get_name() != "Parent" {
+                return None;
+            }
+            parents += 1;
+            current = match field.get_prefix() {
+                Prefix::Identifier(identifier) => {
+                    if identifier.get_name() != "script" {
+                        return None;
+                    }
+                    None
+                }
+                Prefix::Field(next) => Some(next.as_ref()),
+                _ => return None,
+            };
+        }
+
+        let sourcemap = self.cached_sourcemap.as_ref()?;
+        let mut instance_path = sourcemap.get_absolute_instance_path(source)?;
+        for _ in 0..parents {
+            instance_path.parent();
+        }
+
+        Some(instance_path)
     }
 
     fn resolve_roblox_require(&self, call: &FunctionCall, source: &Path) -> Option<PathBuf> {
